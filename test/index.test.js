@@ -12,6 +12,7 @@ function createFullCtx() {
   const listeners = new Map();
   const contextDefs = [];
   const tools = [];
+  const effectDisposers = [];
   const ctx = {
     logger: { warn: () => {}, info: () => {} },
     on(name, fn) {
@@ -19,8 +20,29 @@ function createFullCtx() {
       listeners.get(name).push(fn);
       return () => {};
     },
-    systemPrompt: { context: (def) => contextDefs.push(def) },
-    tools: { register: (def) => tools.push(def) },
+    effect(fn) {
+      const disposer = fn();
+      if (typeof disposer === 'function') effectDisposers.push(disposer);
+      return disposer;
+    },
+    systemPrompt: {
+      context: (def) => {
+        contextDefs.push(def);
+        return () => {
+          const index = contextDefs.indexOf(def);
+          if (index >= 0) contextDefs.splice(index, 1);
+        };
+      },
+    },
+    tools: {
+      register: (def) => {
+        tools.push(def);
+        return () => {
+          const index = tools.indexOf(def);
+          if (index >= 0) tools.splice(index, 1);
+        };
+      },
+    },
     agents: { get: () => undefined },
     sessions: { get: () => ({ append: () => {} }) },
     sessionPersistence: { readFrom: async () => ({ events: [] }) },
@@ -32,6 +54,9 @@ function createFullCtx() {
     },
     _contextDefs: contextDefs,
     _tools: tools,
+    _disposeEffects() {
+      for (const dispose of effectDisposers.splice(0).reverse()) dispose();
+    },
   };
   return ctx;
 }
@@ -47,6 +72,21 @@ test('apply 挂载两个 half:llm/stream 监听 + pause_work 工具 + systemProm
   assert.ok(ctx._tools.some((t) => t.name === 'pause_work'), 'continue 注册 pause_work 工具');
   assert.ok(ctx._contextDefs.some((d) => d.name === 'dsh-run-guard:todo-status'), 'continue 注册 systemPrompt context');
   assert.ok(ctx._listeners('session/event').length >= 1, 'continue 注册 session/event 监听');
+});
+
+test('热重载释放旧的 systemPrompt context 和 pause_work 工具', () => {
+  const ctx = createFullCtx();
+  apply(ctx, resolveConfig());
+  assert.equal(ctx._contextDefs.length, 1);
+  assert.equal(ctx._tools.length, 1);
+
+  ctx._disposeEffects();
+  assert.equal(ctx._contextDefs.length, 0);
+  assert.equal(ctx._tools.length, 0);
+
+  apply(ctx, resolveConfig());
+  assert.equal(ctx._contextDefs.length, 1);
+  assert.equal(ctx._tools.length, 1);
 });
 
 test('enabled=false 时什么都不挂载', () => {
