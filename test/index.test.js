@@ -27,6 +27,9 @@ function createFullCtx() {
     _listeners(name) {
       return listeners.get(name) ?? [];
     },
+    _emit(name, ...args) {
+      for (const listener of listeners.get(name) ?? []) listener(...args);
+    },
     _contextDefs: contextDefs,
     _tools: tools,
   };
@@ -68,6 +71,32 @@ test('子开关:continue.enabled=false 只挂 guard', () => {
   assert.equal(ctx._listeners('llm/stream').length, 1, 'guard 仍挂载');
   assert.equal(ctx._tools.length, 0, 'continue 关闭时不注册工具');
   assert.equal(ctx._contextDefs.length, 0);
+});
+
+test('volatile-update 可启用关闭的 half 且不会重复挂载', () => {
+  const config = resolveConfig({ guard: { enabled: false }, continue: { enabled: false } });
+  const ctx = createFullCtx();
+  apply(ctx, config);
+  assert.equal(ctx._listeners('llm/stream').length, 0);
+  assert.equal(ctx._tools.length, 0);
+  assert.equal(ctx._listeners('loader/volatile-update').length, 1);
+
+  config.guard.enabled = true;
+  ctx._emit('loader/volatile-update', [['guard', 'enabled']]);
+  assert.equal(ctx._listeners('llm/stream').length, 1, '更新后挂载 guard');
+  assert.equal(ctx._listeners('agent/request-error').length, 1, '更新后挂载 guard recovery');
+  assert.equal(ctx._tools.length, 0, 'continue 仍保持关闭');
+
+  config.continue.enabled = true;
+  ctx._emit('loader/volatile-update', [['continue', 'enabled']]);
+  assert.equal(ctx._tools.length, 1, '更新后挂载 continue');
+  assert.equal(ctx._contextDefs.length, 1, '更新后挂载 system prompt');
+
+  ctx._emit('loader/volatile-update', [['guard', 'enabled'], ['continue', 'enabled']]);
+  assert.equal(ctx._listeners('llm/stream').length, 1, '重复更新不重复挂载 guard');
+  assert.equal(ctx._listeners('agent/request-error').length, 1, '重复更新不重复挂载 recovery');
+  assert.equal(ctx._tools.length, 1, '重复更新不重复挂载 continue');
+  assert.equal(ctx._contextDefs.length, 1, '重复更新不重复挂载 system prompt');
 });
 
 test('resolveConfig 填充嵌套默认值', () => {
