@@ -5,7 +5,8 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { apply, resolveConfig, name } from '../lib/index.js';
+import { readFile } from 'node:fs/promises';
+import { apply, resolveConfig, name, PLUGIN_VERSION } from '../lib/index.js';
 
 /** Full Cordis-like context serving both halves. */
 function createFullCtx() {
@@ -23,7 +24,9 @@ function createFullCtx() {
     tools: { register: (def) => tools.push(def) },
     agents: { get: () => undefined },
     sessions: { get: () => ({ append: () => {} }) },
-    sessionPersistence: { readFrom: async () => ({ events: [] }) },
+    sessionPersistence: {
+      open: async () => ({ read: async () => ({ events: [] }), close: async () => {} }),
+    },
     _listeners(name) {
       return listeners.get(name) ?? [];
     },
@@ -35,6 +38,11 @@ function createFullCtx() {
 
 test('插件名称为 dsh-run-guard', () => {
   assert.equal(name, 'dsh-run-guard');
+});
+
+test('PLUGIN_VERSION 与 package.json 一致(加载日志靠它辨别跑的是哪一版)', async () => {
+  const pkg = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.equal(PLUGIN_VERSION, pkg.version);
 });
 
 test('apply 挂载两个 half:llm/stream 监听 + pause_work 工具 + systemPrompt context', () => {

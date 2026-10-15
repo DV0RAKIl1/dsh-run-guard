@@ -123,7 +123,9 @@ test('合并入口:apply 挂载 recovery(guard.enabled 时注册 agent/request-e
   ctx.tools = { register: () => {} };
   ctx.agents = { get: () => undefined };
   ctx.sessions = { get: () => ({ append: () => {} }) };
-  ctx.sessionPersistence = { readFrom: async () => ({ events: [] }) };
+  ctx.sessionPersistence = {
+    open: async () => ({ read: async () => ({ events: [] }), close: async () => {} }),
+  };
   apply(ctx, resolveConfig({}));
   assert.ok(ctx._listeners('agent/request-error').length >= 1, 'guard 开启时应注册 recovery');
   // guard.enabled=false 时不注册
@@ -132,7 +134,9 @@ test('合并入口:apply 挂载 recovery(guard.enabled 时注册 agent/request-e
   ctx2.tools = { register: () => {} };
   ctx2.agents = { get: () => undefined };
   ctx2.sessions = { get: () => ({ append: () => {} }) };
-  ctx2.sessionPersistence = { readFrom: async () => ({ events: [] }) };
+  ctx2.sessionPersistence = {
+    open: async () => ({ read: async () => ({ events: [] }), close: async () => {} }),
+  };
   apply(ctx2, resolveConfig({ guard: { enabled: false } }));
   assert.equal(ctx2._listeners('agent/request-error').length, 0, 'guard 关闭时不注册 recovery');
 });
@@ -194,4 +198,98 @@ test('resolveConfig 默认 autoRetryErrors=[PI_AI_ERROR],可覆盖', () => {
   assert.deepEqual(c.guard.autoRetryErrors, ['PI_AI_ERROR']);
   const c2 = resolveConfig({ guard: { autoRetryErrors: ['X_ERROR'] } });
   assert.deepEqual(c2.guard.autoRetryErrors, ['X_ERROR']);
+});
+
+// ───────────────── llm/retry 事件的链语义(会话日志格式校验) ─────────────────
+//
+// dsh 把 `llm/retry.retry` 定义为 (turn, step, provider, policyKey) 这条
+// provider-policy 链上的尝试序号:必须从 1 开始连续,且同一条链上的 retryId
+// 必须保持不变。按 per-turn 计数写会在"同一 turn 的第二次中断换了 step"时
+// 写出 retry=2 的新链,使会话日志被判定损坏 —— 以下用例锁住这个修复。
+
+/** 记录 llm/retry append 的 session。 */
+function sessionHarness() {
+  const appended = [];
+  const session = { id: 's1', append: (type, data) => appended.push({ type, data }) };
+  return { appended, session };
+}
+
+test('llm/retry 同一 step 链内:序号连续、retryId 固定', async () => {
+  const ctx = createCtx();
+  applyGuardRecovery(ctx, { maxGuardRetries: 3 });
+  const listener = ctx._listeners('agent/request-error')[0];
+  const { appended, session } = sessionHarness();
+  const next = async () => undefined;
+  const payload = () => errorPayload({ agent: { id: 's1', session }, turn: 1, step: 7 });
+
+  for (let i = 0; i < 3; i++) assert.deepEqual(await listener(payload(), next), { kind: 'retry' });
+
+  assert.equal(appended.length, 3);
+  assert.deepEqual(appended.map((a) => a.type), ['llm/retry', 'llm/retry', 'llm/retry']);
+  assert.deepEqual(appended.map((a) => a.data.retry), [1, 2, 3]);
+  assert.deepEqual(appended.map((a) => a.data.retryId), ['run-guard:1:7', 'run-guard:1:7', 'run-guard:1:7']);
+  assert.ok(appended.every((a) => a.data.turn === 1 && a.data.step === 7));
+  assert.ok(appended.every((a) => a.data.retry <= a.data.maxRetries), 'retry 不得超过 maxRetries');
+  assert.ok(appended.every((a) => a.data.mode === 'normal' && a.data.policyKey === 'dsh-run-guard:auto-retry'));
+});
+
+test('换 step 即新链:retry 从 1 重新开始(会话损坏的回归点)', async () => {
+  const ctx = createCtx();
+  applyGuardRecovery(ctx, { maxGuardRetries: 3 });
+  const listener = ctx._listeners('agent/request-error')[0];
+  const { appended, session } = sessionHarness();
+  const next = async () => undefined;
+
+  // 同一 turn 内:step 34 中断一次 → 重试后模型跑到 step 47 又中断
+  await listener(errorPayload({ agent: { id: 's1', session }, turn: 1, step: 34 }), next);
+  await listener(errorPayload({ agent: { id: 's1', session }, turn: 1, step: 47 }), next);
+
+  assert.deepEqual(appended.map((a) => a.data.retry), [1, 1], '新 step 是一条新链,retry 必须从 1 开始');
+  assert.deepEqual(appended.map((a) => a.data.retryId), ['run-guard:1:34', 'run-guard:1:47'], '不同链不得共用 retryId');
+});
+
+test('超过 maxGuardRetries:不再写 llm/retry', async () => {
+  const ctx = createCtx();
+  applyGuardRecovery(ctx, { maxGuardRetries: 1 });
+  const listener = ctx._listeners('agent/request-error')[0];
+  const { appended, session } = sessionHarness();
+  const next = async () => undefined;
+  const payload = () => errorPayload({ agent: { id: 's1', session }, turn: 1, step: 3 });
+
+  assert.deepEqual(await listener(payload(), next), { kind: 'retry' });
+  assert.equal(await listener(payload(), next), undefined, '超限后不再重试');
+  assert.equal(appended.length, 1, '超限的那次不应留下 llm/retry');
+});
+
+test('turn/end 清理链计数:新 turn 的同 step 重新从 1 开始', async () => {
+  const ctx = createCtx();
+  applyGuardRecovery(ctx, { maxGuardRetries: 3 });
+  const listener = ctx._listeners('agent/request-error')[0];
+  const { appended, session } = sessionHarness();
+  const next = async () => undefined;
+  const emit = (s, e) => { for (const fn of ctx._listeners('session/event')) fn(s, e); };
+
+  await listener(errorPayload({ agent: { id: 's1', session }, turn: 1, step: 5 }), next);
+  await listener(errorPayload({ agent: { id: 's1', session }, turn: 1, step: 5 }), next);
+  emit(session, ev('turn/end', { turn: 1 }));
+  await listener(errorPayload({ agent: { id: 's1', session }, turn: 2, step: 5 }), next);
+
+  assert.deepEqual(appended.map((a) => a.data.retry), [1, 2, 1]);
+  assert.deepEqual(appended.map((a) => a.data.retryId), ['run-guard:1:5', 'run-guard:1:5', 'run-guard:2:5']);
+});
+
+test('不同会话的链计数互相隔离', async () => {
+  const ctx = createCtx();
+  applyGuardRecovery(ctx, { maxGuardRetries: 3 });
+  const listener = ctx._listeners('agent/request-error')[0];
+  const a = sessionHarness();
+  const b = sessionHarness();
+  const next = async () => undefined;
+
+  await listener(errorPayload({ agent: { id: 's1', session: a.session }, turn: 1, step: 9 }), next);
+  await listener(errorPayload({ agent: { id: 's2', session: b.session }, turn: 1, step: 9 }), next);
+  await listener(errorPayload({ agent: { id: 's1', session: a.session }, turn: 1, step: 9 }), next);
+
+  assert.deepEqual(a.appended.map((x) => x.data.retry), [1, 2]);
+  assert.deepEqual(b.appended.map((x) => x.data.retry), [1]);
 });

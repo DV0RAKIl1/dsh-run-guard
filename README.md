@@ -2,6 +2,8 @@
 
 > DeepSeek Harness 插件 · **Agent 运行节奏守护** — 一体两面,让 LLM 在长任务中既不会「推理死循环停不下来」,也不会「想完就停不干活」。
 
+> **要求 dsh `0.2.0-rc.2`**（peerDependencies 由 dsh 在安装与启动时校验；不匹配会被拒绝加载或要求 exact-version 豁免）。
+
 [![GitHub stars](https://img.shields.io/github/stars/Dis2017/dsh-run-guard?style=flat-square)](https://github.com/Dis2017/dsh-run-guard)
 [![dsh-plugin](https://img.shields.io/badge/ecosystem-dsh--plugin-blue?style=flat-square)](https://github.com/topics/dsh-plugin)
 [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
@@ -40,7 +42,8 @@ DeepSeek Harness 的 agent loop 本身对这两种异常都没有调控机制。
                                             ▼
                                    agent/request-error 恢复扩展点
                                             │ 错误码 ∈ {REASONING_GUARD} ∪ autoRetryErrors 且
-                                            │ 该 turn 重试 < maxGuardRetries → 自动重跑 step
+                                            │ 该 turn 重试 < maxGuardRetries → 写一条 llm/retry
+                                            │ (序号按 (turn,step) 链计算)并自动重跑 step
                                             └─ 超限或非可重试错误 → turn 以 error 结束(用户可见)
                                             ▲
                                             │ 天然抑制:continue 只在 completed 触发
@@ -53,9 +56,11 @@ turn/end (completed) ──► [continue] 有 todo → 注入状态续跑(计数
 | 扩展点 | 用途 |
 |--------|------|
 | `llm/stream`(waterfall) | guard:包装每次模型调用,拦截 reasoning 死循环 |
+| `agent/request-error`(waterfall) | recovery:中断/白名单错误自动重试 |
 | `session/event` | continue:跟踪 turn 生命周期、todo 状态、产出判定 |
 | `systemPrompt.context` | continue:预防层——有未完成 todo 时注入状态与引导 |
 | `tools.register` | continue:注册 `pause_work` 暂停工具 |
+| `plugins.row.config`(client slot) | 配置入口:Plugins 页面上的 run-guard 配置卡片 |
 
 ---
 
@@ -64,17 +69,21 @@ turn/end (completed) ──► [continue] 有 todo → 注入状态续跑(计数
 ### 安装(GitHub 发布版,推荐)
 
 ```bash
-dsh plugin --profile web add "github:Dis2017/dsh-run-guard#v0.1.18"
+dsh plugin --profile web add "github:Dis2017/dsh-run-guard#v0.2.1"
 ```
 
 `dsh plugin add` 检测到包内 `dsh.bundle` 声明后自动挂载:追加进 profile 的 bundles 列表,插件行由 bundle patch 提供。
 
 ### 验证
 
-1. 重启 GUI
-2. 打开 **设置 → 插件 → Plugin list**,确认 `dsh-run-guard` 为 **Mounted / Enabled**
-3. 打开 **设置 → Run guard**,可编辑全部配置项(总开关 / Guard 死循环拦截 / Continue 自动继续),保存后落盘、重启生效
+1. 重启 GUI（或让 dsh-hmr 完成一次配置重载）
+2. 打开 **设置 → 插件**,确认 `dsh-run-guard` 为 **Mounted / Enabled**
+3. 展开该 bundle 的 **run-guard** 行 → 打开它的配置页，编辑总开关 / Guard 死循环拦截 / Continue 自动继续；保存后 dsh 写回 profile patch 并重载插件，**无需重启进程**
 4. 正常使用:死循环会被 1~2 秒内中断并自动重试(页面可见);「想完就停」后会自动收到续跑提示
+
+> **0.2.0-rc.2 起配置入口变化**：插件不再自注册 settings 命名空间（`ctx.settings.register` 已删除），宿主也**不会**按 `Config` schema 自动生成配置页（官方 `dsh-settings` 文档：`autoGenerate` 目前没有已发布的客户端消费）。配置入口必须由插件自己提供 client 组件，注册到 Plugins 页面的 `plugins.row.config` slot，key 为 `<包名>#<patch 行 id>`（本插件：`dsh-run-guard#run-guard`）；没有注册者的行不显示任何配置控件。表单能力由宿主下发（`ctx.configForms.get('run-guard')`），不再需要插件自建 HTTP 路由。
+>
+> 另外，**只有标记 `.volatile()` 的字段可写**（宿主按此判定哪些路径能 live 编辑），新增配置项时别忘了加这个标记；`test/settings.test.js` 有回归保护。
 
 ### 开发模式(绝对路径挂载,改代码即时生效)
 
@@ -88,6 +97,8 @@ dsh plugin --profile web add "github:Dis2017/dsh-run-guard#v0.1.18"
 ---
 
 ## ⚙️ 配置
+
+配置由 dsh 的 Cordis Loader 按插件导出的 `Config` schema 解析 profile patch 里的插件条目；编辑入口在 Plugins 页面（见上文「验证」）。下表是全部字段：
 
 | 配置项 | 默认 | 说明 |
 |--------|------|------|
@@ -113,12 +124,15 @@ pnpm install
 pnpm test
 ```
 
-54 个单元/集成测试,覆盖:
+92 个单元/集成测试,覆盖:
 
 - **guard 检测器**:死循环触发、正常流不误报、硬闸、滑动窗口精确性、极端配置
 - **中断恢复**:guard/上游错误自动重试、超限停止、turn 隔离、白名单外与持久错误不干预
+- **llm/retry 链语义**:同一 `(turn,step)` 链内序号连续且 `retryId` 固定、换 step 即新链从 1 开始、超限不写事件、`turn/end` 清理、跨会话隔离
 - **流拦截**:透传、中断、顺序保持、退化降级
-- **continue**:todo 续跑、想完就停续跑、暂停抑制、计数上限、UI 投影恢复
+- **continue**:todo 续跑、想完就停续跑、暂停抑制、计数上限、UI 投影恢复、持久化恢复走 `sessionPersistence.open(id,'read')`
+- **配置**:`Volatile` 句柄解包、volatile/普通配置等价、每个叶子字段都标记 `.volatile()`
+- **client half**:bundle 注册形状、`plugins.row.config` key、字段表与 Config schema 一致性、summary/page 两分支渲染
 - **两 half 集成**:guard 中断不误推、continue 推进的新 turn 死循环被拦截
 
 ---
@@ -145,6 +159,19 @@ ls node_modules/@deepseek-ai/
 
 **修复**:本插件的 guard 保证**之后**不会再产生;存量会话需清理数据(结构保留、清空死循环文本)或归档。
 
+### `stored log is corrupt: SessionFormatError: llm/retry skips its policy attempt sequence`
+
+**根因**:0.1.x 时代本插件把 per-turn 的重试次数直接写进伪造的 `llm/retry.retry`。dsh 的会话格式校验(`dsh-session-format-v3-to-v4`,**0.2.0-rc.1 才引入**)要求该字段是 `(turn, step, provider, policyKey)` 链上的尝试序号、必须从 1 开始连续 —— 于是"同一 turn 的第二次中断发生在新的 step"时写出了 `retry=2` 的新链,整份日志被判损坏,会话再也打不开。
+
+**修复**:本插件已改为 per-`(turn,step)` 链计数、`retryId` 每条链固定。升级后新产生的中断不再损坏会话。**已损坏的存量会话不会被自动修复**——它们需要人工订正日志里那条违规的 `llm/retry`(`retry` 改为该链应有的序号、`retryId` 改为 `run-guard:<turn>:<step>`)后重新压缩,或直接归档放弃。
+
+诊断哪条会话损坏、坏在哪条链:
+
+```bash
+zstd -dc ~/.dsh/sessions/<workspace>/<session-id>/session.v4.jsonl.zstd \
+  | grep -n '"retryId":"run-guard:' 
+```
+
 ---
 
 ## 🤝 开发
@@ -154,12 +181,14 @@ ls node_modules/@deepseek-ai/
 ```
 dsh-run-guard/
 ├── lib/
-│   ├── index.js      # 合并入口:嵌套配置 + 按子开关挂载
+│   ├── index.js      # 合并入口:Config schema(volatile) + 按子开关挂载
+│   ├── config.js     # 配置读取:解包 Volatile 句柄
 │   ├── guard.js      # 刹车 half:检测器 + llm/stream 拦截 + 中断文案
-│   └── continue.js   # 油门 half:自动继续 + pause_work
-├── test/             # 54 个测试(guard / stream / continue / index / integration)
-├── cordis.patch.yml  # bundle patch(dsh plugin add 自动挂载)
-└── scripts/
+│   ├── continue.js   # 油门 half:自动继续 + pause_work
+│   ├── client.js     # client half:Plugins 页面的 run-guard 配置卡片
+│   └── debug.js      # /tmp/dsh-run-guard.log 诊断日志
+├── test/             # 86 个测试(guard / stream / continue / index / recovery / settings / client / integration)
+└── cordis.patch.yml  # bundle patch(dsh plugin add 自动挂载)
 ```
 
 ### 迭代流程
@@ -167,15 +196,16 @@ dsh-run-guard/
 ```bash
 git commit -m "fix: ..."
 git push origin main
-git tag v0.1.18 && git push origin v0.1.18
-dsh plugin --profile web add "github:Dis2017/dsh-run-guard#v0.1.18"   # 或 remove + add 升级
+git tag v0.2.1 && git push origin v0.2.1
+dsh plugin --profile web add "github:Dis2017/dsh-run-guard#v0.2.1"   # 或 remove + add 升级
 ```
 
 ### 依赖约定(重要)
 
 - `@deepseek-ai/*` → **peerDependencies**(宿主提供单例),绝不能放 `dependencies`
-- 业务依赖(裸 `schemastery` 等)→ `dependencies`
+- schema 必须用 `@deepseek-ai/schemastery`(宿主单例,`~3.18.4`),不要用裸 `schemastery`:后者 3.18.0 没有 `.volatile()`,字段不会进设置表单
 - 测试用的 dsh 依赖 → `devDependencies`(镜像 peer 版本,不随安装)
+- client half 通过 `dsh.client.inject` 声明它依赖的 client 包(`@deepseek-ai/dsh-client-ui-settings` 提供 `configForms`，`@deepseek-ai/dsh-client-ui-plugin-manager` 声明 `plugins.row.config` slot)；client 侧不需要、也不应声明 `@deepseek-ai/dsh-*` 的 Host 包
 
 违反此约定会导致上述 `prepare` 错误。
 

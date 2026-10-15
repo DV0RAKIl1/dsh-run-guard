@@ -59,7 +59,9 @@ function createFullCtx() {
       }),
     },
     sessions: { get: () => ({ append: (type, data) => appended.push({ type, data }) }) },
-    sessionPersistence: { readFrom: async () => ({ events: [] }) },
+    sessionPersistence: {
+      open: async () => ({ read: async () => ({ events: [] }), close: async () => {} }),
+    },
     _listeners(name) {
       return listeners.get(name) ?? [];
     },
@@ -112,7 +114,7 @@ test('协同:continue 注入 followup 后,新 turn 死循环被 guard 拦截', a
 
   // 自动继续的新 turn:模型推理死循环 → guard 拦截
   emit(session, ev('turn/start', { turn: 2 }));
-  emit(session, ev('user/message', { content: [{ type: 'text', text: '继续' }], source: { kind: 'plugin', plugin: 'dsh-run-guard' } }));
+  emit(session, ev('user/message', { content: [{ type: 'text', text: '继续' }], source: { kind: 'run-guard', form: 'notice', summary: 'x' } }));
   const chunks = await collect(streamListener({}, () => deadLoopStream(500)));
   const finish = chunks.find((c) => c.type === 'finish');
   assert.ok(finish && finish.reason.failure.code === REASONING_GUARD_CODE, 'followup 新 turn 的死循环应被 guard 拦截');

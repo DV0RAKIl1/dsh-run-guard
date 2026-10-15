@@ -24,13 +24,14 @@ const msg = (types) => ({
  * - 收集 session/event 监听器、systemPrompt.context 定义、pause_work 工具定义
  * - agents.get 返回记录 followup 的 mock agent
  * - sessions.get 返回记录 append 的 mock session
- * - sessionPersistence.readFrom 默认返回空日志
+ * - sessionPersistence.open 默认返回空日志的只读句柄
  */
 function createHarness(options = {}) {
   const followups = []; // { sessionId, text }
   const appended = []; // { type, data }
   const listeners = new Map();
   const contextDefs = [];
+  const persistenceCalls = []; // { sessionId, access }
   let pauseTool = null;
 
   const ctx = {
@@ -53,7 +54,7 @@ function createHarness(options = {}) {
           ? undefined
           : {
               followup(message) {
-                followups.push({ sessionId, text: message.content[0].text });
+                followups.push({ sessionId, text: message.content[0].text, source: message.source });
               },
             },
     },
@@ -63,9 +64,15 @@ function createHarness(options = {}) {
       }),
     },
     sessionPersistence: {
-      readFrom:
-        options.readFromImpl ??
-        (async () => ({ events: options.persistedEvents ?? [] })),
+      open:
+        options.openImpl ??
+        (async (sessionId, access) => {
+          persistenceCalls.push({ sessionId, access });
+          return {
+            read: async () => ({ events: options.persistedEvents ?? [], eventState: 'owned' }),
+            close: async () => {},
+          };
+        }),
     },
   };
 
@@ -74,6 +81,7 @@ function createHarness(options = {}) {
     followups,
     appended,
     contextDefs,
+    persistenceCalls,
     get pauseTool() {
       return pauseTool;
     },
@@ -243,7 +251,7 @@ test('插件注入的 user/message 不重置计数', async () => {
   await completeThinkStopTurn(h, session, 60); // count=1 触发
   // 自动继续新 turn:首条消息是插件注入(非 user source)→ 不重置计数
   h.emit(session, ev('turn/start', { turn: 61 }));
-  h.emit(session, ev('user/message', { content: [{ type: 'text', text: '继续' }], source: { kind: 'plugin', plugin: 'dsh-run-guard' } }));
+  h.emit(session, ev('user/message', { content: [{ type: 'text', text: '继续' }], source: { kind: 'run-guard', form: 'notice', summary: 'x' } }));
   await completeThinkStopTurn(h, session, 62); // count=2 触发
   await completeThinkStopTurn(h, session, 63); // count=3 停止
   await completeThinkStopTurn(h, session, 64); // 停止
@@ -309,7 +317,7 @@ test('UI 投影恢复:自动继续的新 turn 首条插件消息补写 todo/writ
   assert.equal(h.followups.length, 1);
   // 自动继续的新 turn:首条消息为本插件注入
   h.emit(session, ev('turn/start', { turn: 101 }));
-  h.emit(session, ev('user/message', { content: [{ type: 'text', text: '继续' }], source: { kind: 'plugin', plugin: 'dsh-run-guard' } }));
+  h.emit(session, ev('user/message', { content: [{ type: 'text', text: '继续' }], source: { kind: 'run-guard', form: 'notice', summary: 'x' } }));
   await sleep(20);
   const write = h.appended.find((a) => a.type === 'todo/write');
   assert.ok(write, '应补写 todo/write 恢复 UI 投影');
@@ -339,7 +347,7 @@ test('UI 投影恢复:模型已写新 todo 时不覆盖(modelWrote 守卫)', asy
   assert.equal(h.followups.length, 1);
   // 自动继续的新 turn:模型先写新 todo(声明新计划)→ modelWrote=true
   h.emit(session, ev('turn/start', { turn: 121 }));
-  h.emit(session, ev('user/message', { content: [{ type: 'text', text: '继续' }], source: { kind: 'plugin', plugin: 'dsh-run-guard' } }));
+  h.emit(session, ev('user/message', { content: [{ type: 'text', text: '继续' }], source: { kind: 'run-guard', form: 'notice', summary: 'x' } }));
   h.emit(session, ev('todo/write', { todos: [{ content: '模型新计划', status: 'pending' }] }));
   await sleep(20);
   // scheduleRestore 执行时发现 modelWrote=true → 不覆盖模型声明
@@ -376,9 +384,9 @@ test('agents.get 返回 undefined → followup 静默跳过,不崩溃', async ()
   assert.equal(h.followups.length, 0);
 });
 
-test('restoreTodoState 失败(readFrom 抛错)不阻断 turn 处理', async () => {
+test('restoreTodoState 失败(open 抛错)不阻断 turn 处理', async () => {
   const h = createHarness({
-    readFromImpl: async () => {
+    openImpl: async () => {
       throw new Error('storage broken');
     },
   });
@@ -386,4 +394,25 @@ test('restoreTodoState 失败(readFrom 抛错)不阻断 turn 处理', async () =
   // 内存无 todo 状态 + 持久化读取失败 → 视为无 todo,想完就停仍触发
   await completeThinkStopTurn(h, session, 160);
   assert.equal(h.followups.length, 1, '恢复失败不影响无 todo 自动继续');
+});
+
+test('注入消息带 run-guard source kind(0.2 无通用 plugin kind)', async () => {
+  const h = createHarness();
+  applyContinue(h.ctx, { enabled: true, maxAutoFollowups: 3 });
+  await completeThinkStopTurn(h, session, 170);
+  assert.equal(h.followups.length, 1);
+  assert.deepEqual(h.followups[0].source, { kind: 'run-guard', form: 'notice', summary: 'run-guard 自动继续' });
+});
+
+test('重启恢复走 sessionPersistence.open(id, "read") 并关闭句柄', async () => {
+  const h = createHarness({
+    persistedEvents: [
+      { type: 'todo/write', data: { todos: [{ content: '持久化任务2', status: 'pending' }] } },
+    ],
+  });
+  applyContinue(h.ctx, { enabled: true, maxAutoFollowups: 3 });
+  await completeThinkStopTurn(h, session, 180);
+  assert.deepEqual(h.persistenceCalls, [{ sessionId: 's1', access: 'read' }], '应以只读句柄打开会话');
+  assert.equal(h.followups.length, 1);
+  assert.ok(h.followups[0].text.includes('持久化任务2'));
 });
