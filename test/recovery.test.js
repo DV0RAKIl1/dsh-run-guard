@@ -227,7 +227,11 @@ test('llm/retry 同一 step 链内:序号连续、retryId 固定', async () => {
   assert.equal(appended.length, 3);
   assert.deepEqual(appended.map((a) => a.type), ['llm/retry', 'llm/retry', 'llm/retry']);
   assert.deepEqual(appended.map((a) => a.data.retry), [1, 2, 3]);
-  assert.deepEqual(appended.map((a) => a.data.retryId), ['run-guard:1:7', 'run-guard:1:7', 'run-guard:1:7']);
+  assert.deepEqual(appended.map((a) => a.data.retryId), [
+    'run-guard:[1,7,"opencode","dsh-run-guard:auto-retry"]',
+    'run-guard:[1,7,"opencode","dsh-run-guard:auto-retry"]',
+    'run-guard:[1,7,"opencode","dsh-run-guard:auto-retry"]',
+  ]);
   assert.ok(appended.every((a) => a.data.turn === 1 && a.data.step === 7));
   assert.ok(appended.every((a) => a.data.retry <= a.data.maxRetries), 'retry 不得超过 maxRetries');
   assert.ok(appended.every((a) => a.data.mode === 'normal' && a.data.policyKey === 'dsh-run-guard:auto-retry'));
@@ -245,7 +249,30 @@ test('换 step 即新链:retry 从 1 重新开始(会话损坏的回归点)', as
   await listener(errorPayload({ agent: { id: 's1', session }, turn: 1, step: 47 }), next);
 
   assert.deepEqual(appended.map((a) => a.data.retry), [1, 1], '新 step 是一条新链,retry 必须从 1 开始');
-  assert.deepEqual(appended.map((a) => a.data.retryId), ['run-guard:1:34', 'run-guard:1:47'], '不同链不得共用 retryId');
+  assert.deepEqual(appended.map((a) => a.data.retryId), [
+    'run-guard:[1,34,"opencode","dsh-run-guard:auto-retry"]',
+    'run-guard:[1,47,"opencode","dsh-run-guard:auto-retry"]',
+  ], '不同链不得共用 retryId');
+});
+
+test('provider failover 开启独立 retry 链:不复用序号和 retryId', async () => {
+  const ctx = createCtx();
+  applyGuardRecovery(ctx, { maxGuardRetries: 3 });
+  const listener = ctx._listeners('agent/request-error')[0];
+  const { appended, session } = sessionHarness();
+  const next = async () => undefined;
+
+  await listener(errorPayload({ agent: { id: 's1', session }, turn: 1, step: 7, provider: 'opencode' }), next);
+  await listener(errorPayload({ agent: { id: 's1', session }, turn: 1, step: 7, provider: 'openai' }), next);
+  await listener(errorPayload({ agent: { id: 's1', session }, turn: 1, step: 7, provider: 'openai' }), next);
+
+  assert.deepEqual(appended.map((a) => a.data.provider), ['opencode', 'openai', 'openai']);
+  assert.deepEqual(appended.map((a) => a.data.retry), [1, 1, 2]);
+  assert.deepEqual(appended.map((a) => a.data.retryId), [
+    'run-guard:[1,7,"opencode","dsh-run-guard:auto-retry"]',
+    'run-guard:[1,7,"openai","dsh-run-guard:auto-retry"]',
+    'run-guard:[1,7,"openai","dsh-run-guard:auto-retry"]',
+  ]);
 });
 
 test('超过 maxGuardRetries:不再写 llm/retry', async () => {
@@ -275,7 +302,11 @@ test('turn/end 清理链计数:新 turn 的同 step 重新从 1 开始', async (
   await listener(errorPayload({ agent: { id: 's1', session }, turn: 2, step: 5 }), next);
 
   assert.deepEqual(appended.map((a) => a.data.retry), [1, 2, 1]);
-  assert.deepEqual(appended.map((a) => a.data.retryId), ['run-guard:1:5', 'run-guard:1:5', 'run-guard:2:5']);
+  assert.deepEqual(appended.map((a) => a.data.retryId), [
+    'run-guard:[1,5,"opencode","dsh-run-guard:auto-retry"]',
+    'run-guard:[1,5,"opencode","dsh-run-guard:auto-retry"]',
+    'run-guard:[2,5,"opencode","dsh-run-guard:auto-retry"]',
+  ]);
 });
 
 test('不同会话的链计数互相隔离', async () => {

@@ -1,5 +1,5 @@
 /**
- * 配置解析测试(适配 dsh 0.2.0-rc.2)。
+ * 配置解析测试(适配 dsh 0.2.1-rc.2)。
  *
  * 0.2 起插件不再自注册 settings 命名空间(`ctx.settings.register` 已删除):
  * 配置由 Cordis Loader 按插件导出的 `Config` schema 解析 profile patch 里的
