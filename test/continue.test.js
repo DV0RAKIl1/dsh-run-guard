@@ -123,6 +123,21 @@ test('无 todo + 正常产出(正文) → 不触发', async () => {
   assert.equal(h.followups.length, 0);
 });
 
+test('无 todo + 只有空白正文 → 触发 followup', async () => {
+  const h = createHarness();
+  applyContinue(h.ctx, { enabled: true, maxAutoFollowups: 3 });
+  h.emit(session, ev('turn/start', { turn: 2.5 }));
+  h.emit(session, ev('assistant/message', {
+    turn: 2.5,
+    step: 1,
+    message: { role: 'assistant', content: [{ type: 'text', text: ' \n\t' }] },
+  }));
+  h.emit(session, ev('turn/end', { turn: 2.5, reason: { kind: 'completed' } }));
+  await sleep(20);
+  assert.equal(h.followups.length, 1);
+  assert.ok(h.followups[0].text.includes('空白文本'));
+});
+
 test('无 todo + 最后消息含 tool-call → 不触发', async () => {
   const h = createHarness();
   applyContinue(h.ctx, { enabled: true, maxAutoFollowups: 3 });
